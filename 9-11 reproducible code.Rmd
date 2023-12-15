@@ -1,0 +1,1241 @@
+---
+title: "housing fairness_data analysis"
+header-includes:
+# - \usepackage{booktabs}
+#- \usepackage{multirow}
+# - \usepackage{longtable}
+# - \usepackage{pdflscape}
+# - \usepackage{floatrow}
+output: pdf_document
+date: "2023-1-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache = FALSE)
+#get rid of scientific notation
+options(scipen=999)
+```
+
+```{r library setup, include=FALSE}
+#basic packages
+library(tidyverse)
+library(janitor)
+library(dplyr)
+
+#for beautifying plots
+library(ggrepel)
+
+#conjoint analysis package
+library(cregg)
+library(cjoint)
+
+#table formatting packages
+#library(jtools)
+library(stargazer)
+library(gtsummary)
+library(xtable)
+```
+
+```{r}
+#read in csv files
+pilot_clean <- read_csv("cleaned data_5-30.csv")
+
+#remove respondents who did not understand survey
+pilot_clean <- pilot_clean |>
+  filter(response_quality!="did not understand survey")
+```
+
+```{r}
+#reshape data (with randomized attributes)
+convert_to_table_attribute_name <- function(survey_attribute_names) {
+  names = survey_attribute_names
+  names = gsub("Reason for buying", "reason_for_buying", names)
+  names = gsub("Offer type", "offer_type", names)
+  names = gsub("Nationality of buyer", "nationality", names)
+  names = gsub("Offer amount", "offer_amount", names)
+  names = gsub("Buyer type", "buyer_type", names)
+
+  return (names)
+}
+
+# Create a table with response ids, the choiceX_attributeY_name, and corresponding attribute name
+attribute_name_table <- pilot_clean |> select(response_id, starts_with("choice") & contains("name"))
+attribute_name_table <- attribute_name_table |>
+  gather(variable, value, -response_id)
+
+# Convert the name table to a table with response ids, the choiceX_attributeY_option1, and corrsponding attribute name
+attr_name_table_option1 <- attribute_name_table |>
+  mutate(variable = gsub("name", "option1", variable))
+
+# Convert the name table to a table with response ids, the choiceX_attributeY_option2, and corrsponding attribute name
+attr_name_table_option2 <- attribute_name_table |>
+  mutate(variable = gsub("name", "option2", variable))
+
+#Combine the option 1 and option 2 tables to create a table with
+# response ids, the choiceX_attributeY_optionZ, and corrsponding attribute name
+combined_attr_name_table = bind_rows(attr_name_table_option1, attr_name_table_option2)
+combined_attr_name_table <- combined_attr_name_table |>
+  mutate(attribute = convert_to_table_attribute_name(value))
+combined_attr_name_table <- subset(combined_attr_name_table, select = -c(value))
+
+#jreate a table with response ids, the choiceX_attributeY_optionZ, and attribute value
+attribute_value_table <- pilot_clean |> select(response_id, starts_with("choice") & !contains("name"))
+attribute_value_table <- attribute_value_table |>
+  gather(variable, value, -response_id)
+
+#join the attribute name and attribute value tables to create a table with 
+# response ids, the choiceX_attributeY_optionZ, the attribute name, and attribute value
+joined_table <- inner_join(combined_attr_name_table, attribute_value_table, by=c('response_id'='response_id', 'variable'='variable'))
+
+#add choice number and offer number columns to the table based on the
+#choiceX_attributeY_optionZ variable.
+d_offer <- joined_table |>
+  mutate(
+    scenario_num = gsub("choice(\\d+)_(.*)_option(\\d+)", "\\1", variable),
+    offer_num = gsub("choice(\\d+)_(.*)_option(\\d+)", "\\3", variable)
+  )
+
+d_offer <- d_offer |>
+  select(-variable)
+
+d_offer <- d_offer |>
+  spread(attribute, value)
+```
+
+```{r}
+#convert scenario_num to numeric variable
+d_offer <- d_offer |>
+  mutate(scenario_num=as.numeric(scenario_num))
+```
+
+```{r}
+#reshape the respondent's preferences so each choice gets its own row
+d_pref <- pilot_clean |> select(response_id, ends_with("conjoint_question"))
+d_pref <- d_pref |>
+  gather(variable, preference, -response_id) |>
+  ##\\d+ captures more than one digit with the +
+  mutate(
+    scenario_num = gsub("x(\\d+)_conjoint_question", "\\1", variable),
+    preference = as.numeric(gsub("Offer ", "", preference))
+  ) |>
+  select(-variable) |>
+  mutate(scenario_num=as.numeric(scenario_num))
+
+class(d_pref$scenario_num)
+class(d_pref$preference)
+
+#Merge the attributes and preferences
+d_stack <- left_join(d_offer, d_pref)
+d_stack <- d_stack |>
+  mutate(
+    Y=as.numeric(offer_num == preference)
+  )
+
+#create variable Y to indicate that the respondent preferred that offer.
+###essentially, we are asking if the preference is equal to the offer_number, 1 being yes and 0 being no
+d_stack <- d_stack |>
+  mutate(Y=as.numeric(offer_num==preference))
+```
+
+```{r}
+#get rid of commas and dollar signs in offer amount and convert to numeric variable
+d_stack <- d_stack |>
+mutate(offer_amount = as.numeric(gsub("[$,]", "", offer_amount)))
+```
+
+```{r}
+#create offer amount differences for y=1
+d_stack <- d_stack |>
+group_by(response_id) |>
+arrange(response_id, Y) |>
+mutate(offer_diff = offer_amount - lag(offer_amount, default = first(offer_amount))) |>
+ungroup()
+
+#create offer amount differences for y=0
+d_stack <- d_stack |>
+group_by(response_id) |>
+arrange(response_id, Y) |>
+mutate(offer_diff = if_else(
+  Y == 0,
+  (offer_amount - lead(offer_amount, default = first(offer_amount))), offer_diff)) |>
+ungroup()
+```
+
+```{r}
+#Respondent Demographics
+
+#add demographic data to d_stack
+d_stack <- inner_join(d_stack, pilot_clean |> dplyr::select(age, homeowner_status, number_of_houses, landlord, latino, latino_7_text, race, zip_code, household_income, edu_level, gender, citizenship, pol_ideology, pol_party, pol_party_4_text, pol_repub, pol_dem, pol_2_party, response_id, response_quality, duration_in_seconds, attention_3, response_id), by = "response_id")
+
+# pilot_clean <- left_join(pilot_clean, response_quality |> dplyr::select(response_quality, response_id), by="response_id")
+# duplicates <- duplicated(pilot_clean$response_id)
+# which(duplicates)
+```
+
+```{r}
+#create simple offer_diff bin var
+d_stack <- d_stack |>
+mutate(
+  offer_diff_simple_bin = dplyr::case_when(
+    offer_diff <0 ~ "lower",
+    offer_diff == 0 ~ "No difference",
+    offer_diff >0 ~ "higher"))
+d_stack <- d_stack |>
+  mutate(offer_diff_simple_bin=as.factor(offer_diff_simple_bin))
+```
+
+```{r}
+#check decile ranges for offer_diff
+d_stack <- d_stack |>
+  mutate(
+    offer_diff_binned_deciles = cut(
+      offer_diff,
+      breaks = quantile(offer_diff, probs = seq(0, 1, by = 0.1)),
+      labels = c("1st decile", "2nd decile", "3rd decile", "4th decile", "5th decile", "6th decile", "7th decile", "8th decile", "9th decile", "10th decile"),
+      include.lowest = TRUE,
+      dig.lab = 10
+    )
+  )
+
+decile_1_data <- d_stack[d_stack$offer_diff_binned_deciles == "1st decile", "offer_diff"]
+decile_2_data <- d_stack[d_stack$offer_diff_binned_deciles == "2nd decile", "offer_diff"]
+decile_3_data <- d_stack[d_stack$offer_diff_binned_deciles == "3rd decile", "offer_diff"]
+decile_4_data <- d_stack[d_stack$offer_diff_binned_deciles == "4th decile", "offer_diff"]
+decile_5_data <- d_stack[d_stack$offer_diff_binned_deciles == "5th decile", "offer_diff"]
+decile_6_data <- d_stack[d_stack$offer_diff_binned_deciles == "6th decile", "offer_diff"]
+decile_7_data <- d_stack[d_stack$offer_diff_binned_deciles == "7th decile", "offer_diff"]
+decile_8_data <- d_stack[d_stack$offer_diff_binned_deciles == "8th decile", "offer_diff"]
+decile_9_data <- d_stack[d_stack$offer_diff_binned_deciles == "9th decile", "offer_diff"]
+decile_10_data <- d_stack[d_stack$offer_diff_binned_deciles == "10th decile", "offer_diff"]
+
+# View the full range of values in each decile
+print(summary(decile_1_data))
+print(summary(decile_2_data))
+print(summary(decile_3_data))
+print(summary(decile_4_data))
+print(summary(decile_5_data))
+print(summary(decile_6_data))
+print(summary(decile_7_data))
+print(summary(decile_8_data))
+print(summary(decile_9_data))
+print(summary(decile_10_data))
+
+#create variable offer_diff_binned_deciles
+d_stack <- d_stack |>
+mutate(
+  offer_diff_binned_deciles = dplyr::case_when(
+    offer_diff <= -100000 ~ "lower by $100,000-$200,000",
+    offer_diff >=-95000 & offer_diff <=-65000 ~ "lower by $65,000-$95,000",
+    offer_diff >=-60000 & offer_diff <=-40000 ~ "lower by $40,000-$60,000",
+    offer_diff >=-35000 & offer_diff <=-20000 ~ "lower by $20,000-$35,000",
+    offer_diff >=-15000 & offer_diff <=-5000 ~ "lower by $5,000-$15,000",
+    offer_diff== 0 ~ "No difference",
+    offer_diff >= 5000 & offer_diff <=15000 ~ "higher by $5,000-$15,000",
+    offer_diff >= 20000 & offer_diff <=35000 ~ "higher by $20,000-$35,000",
+     offer_diff >=40000 & offer_diff <=60000 ~ "higher by $40,000-$60,000",
+    offer_diff >=65000 & offer_diff <=95000 ~ "higher by $65,000-$95,000",
+    offer_diff >=100000 ~ "higher by $100,000-$200,000"),
+  offer_diff_binned_deciles = factor(
+      offer_diff_binned_deciles,
+      level = c("lower by $100,000-$200,000", "lower by $65,000-$95,000", "lower by $40,000-$60,000", "lower by $20,000-$35,000", "lower by $5,000-$15,000", "No difference", "higher by $5,000-$15,000", "higher by $20,000-$35,000", "higher by $40,000-$60,000","higher by $65,000-$95,000","higher by $100,000-$200,000")))
+```
+
+```{r}
+#rename United Kingdom
+  d_stack <- d_stack |>
+    mutate(nationality = case_when(nationality=="United Kingdom (U.K.)" ~ "United Kingdom", TRUE ~ nationality))
+
+#convert all variables into factor variables
+d_stack <- d_stack |> mutate(nationality=as.factor(nationality))
+d_stack <- d_stack |> mutate(offer_type=as.factor(offer_type))
+d_stack <- d_stack |> mutate(reason_for_buying=as.factor(reason_for_buying))
+d_stack <- d_stack |> mutate(buyer_type=as.factor(buyer_type))
+d_stack <- d_stack |> mutate(offer_diff=as.factor(offer_diff))
+d_stack <- d_stack |> mutate(landlord=as.factor(landlord))
+d_stack <- d_stack |> mutate(homeowner_status=as.factor(homeowner_status))
+d_stack <- d_stack |>
+  mutate(response_id=as.factor(response_id))
+
+#re-level nationality
+d_stack <- d_stack |>
+  mutate(nationality = factor(
+    nationality,
+      level = c( "Russia", "China", "Saudi Arabia", "India", "Japan", "Mexico", "United Kingdom", "Canada", "United States")))
+
+# d_stack <- d_stack |>
+#   mutate(nationality = factor(
+#     nationality,
+#       level = c( "United States", "Canada", "United Kingdom", "Mexico", "Japan", "India", "Saudi Arabia", "China",  "Russia")))
+
+#re-level reason for buying
+d_stack <- d_stack |>
+  mutate(reason_for_buying = factor(
+    reason_for_buying,
+      level = c("Investment", "Vacation home", "Primary residence")))
+
+#re-level buyer type
+d_stack <- d_stack |>
+  mutate(buyer_type = factor(
+    buyer_type,
+      level = c("Corporation", "Individual")))
+
+#re-level offer type
+d_stack <- d_stack |>
+  mutate(offer_type = factor(
+    offer_type,
+      level = c("With financing", "All cash")))
+
+#re-label variable names for tables and figures
+attr(d_stack$offer_diff_binned_deciles, "label") <- "Offer difference"
+attr(d_stack$nationality, "label") <- "Nationality"
+attr(d_stack$reason_for_buying, "label") <- "Reason for buying"
+attr(d_stack$offer_type, "label") <- "Offer type"
+attr(d_stack$buyer_type, "label") <- "Buyer type"
+attr(d_stack$offer_diff_simple_bin, "label") <- "Offer difference"
+```
+
+```{r}
+#create variables for interactions
+  #nationality * offer type
+  d_stack$nationality_offer_type <- interaction(d_stack$nationality, d_stack$offer_type, sep = "_")
+
+  #nationality * reason for buying
+  d_stack$nationality_reason <- interaction(d_stack$nationality, d_stack$reason_for_buying, sep = "_")
+  
+  #nationality * buyer type
+  d_stack$nationality_buyer_type <- interaction(d_stack$nationality, d_stack$buyer_type, sep = "_")
+  
+  #nationality * offer amount difference
+  d_stack$nationality_offer_diff <- interaction(d_stack$nationality, d_stack$offer_diff_binned_deciles, sep = "_")
+    
+  #reason for buying * offer amount difference
+        d_stack$reason_offer_diff <- interaction(d_stack$reason_for_buying, d_stack$offer_diff_binned_deciles, sep = "_")
+        
+  #reason for buying * buyer type
+          d_stack$reason_buyer_type <- interaction(d_stack$buyer_type, d_stack$reason_for_buying, sep = "_")
+```
+
+```{r}
+#rename reason_buyer_type levels
+d_stack <- d_stack |>
+mutate(reason_buyer_type = as.factor(gsub("[_]", ": ", reason_buyer_type)))
+#   d_stack <- d_stack |>
+#     mutate(reason_buyer_type = case_when(reason_buyer_type=="Individual_Primary residence"~ "Individual: Primary residence", reason_buyer_type=="Individual_Vacation home" ~ "Individual: Vacation home", reason_buyer_type== "Individual_Investment" ~ "Individual: Investment", 
+# reason_buyer_type== "Corporation_Investment" ~ "Corporation: Investment")) |>
+#   mutate(reason_buyer_type = as.factor(reason_buyer_type))
+
+#re-level reason_buyer_type levels
+d_stack <- d_stack |>
+  mutate(reason_buyer_type = factor(
+    reason_buyer_type,
+      level = c( "Corporation: Investment", "Individual: Investment", "Individual: Vacation home", "Individual: Primary residence")))
+
+#rename nationality_reason levels
+d_stack <- d_stack |>
+mutate(nationality_reason = as.factor(gsub("[_]", ": ", nationality_reason)))
+
+#re-level nationality_reason levels
+d_stack <- d_stack |>
+  mutate(nationality_reason = factor(
+    nationality_reason,
+      level = c( "Russia: Investment", "China: Investment", "Saudi Arabia: Investment", "India: Investment", "Japan: Investment", "Mexico: Investment", "United Kingdom: Investment", "Canada: Investment", "United States: Investment", "Russia: Vacation home", "China: Vacation home", "Saudi Arabia: Vacation home", "India: Vacation home", "Japan: Vacation home", "Mexico: Vacation home", "United Kingdom: Vacation home", "Canada: Vacation home", "United States: Vacation home", "Russia: Primary residence", "China: Primary residence", "Saudi Arabia: Primary residence", "India: Primary residence", "Japan: Primary residence", "Mexico: Primary residence", "United Kingdom: Primary residence", "Canada: Primary residence", "United States: Primary residence")))
+
+#rename nationality_buyer_type levels
+d_stack <- d_stack |>
+mutate(nationality_buyer_type = as.factor(gsub("[_]", ": ", nationality_buyer_type)))
+
+#re-level nationality_buyer_type levels
+d_stack <- d_stack |>
+  mutate(nationality_buyer_type = factor(
+    nationality_buyer_type,
+      level = c( "Russia: Corporation", "China: Corporation", "Saudi Arabia: Corporation", "India: Corporation", "Japan: Corporation", "Mexico: Corporation", "United Kingdom: Corporation", "Canada: Corporation", "United States: Corporation", "Russia: Individual", "China: Individual", "Saudi Arabia: Individual", "India: Individual", "Japan: Individual", "Mexico: Individual", "United Kingdom: Individual", "Canada: Individual", "United States: Individual")))
+
+#create new scale for political ideology
+d_stack <- d_stack |>
+  mutate(pol_ideology_conservative =
+           case_when(pol_ideology == "Conservative" | pol_ideology== "Extremely conservative" ~ "Conservative", TRUE ~ "Not conservative")) |>
+  mutate(pol_ideology_conservative = as.factor(pol_ideology_conservative))
+
+# create binary variable for political ideology
+d_stack <- d_stack |>
+  mutate(pol_party=as.factor(pol_party))
+d_stack <- d_stack |>
+  mutate(pol_2_party=as.factor(pol_2_party))
+
+d_stack <- d_stack |>
+  mutate(landlord = case_when(landlord=="Yes" ~ "Landlord", landlord=="No" ~ "Not a landlord")) |>
+  mutate(landlord=as.factor(landlord))
+
+d_stack <- d_stack |>
+  mutate(homeowner_status = case_when(homeowner_status=="Homeowner (you own your own home or you are finalizing the purchase of a home)" ~ "Homeowner", homeowner_status=="Renter (you rent a house, whether through a landlord, friend, or family member)" ~ "Renter")) |>
+  mutate(homeowner_status=as.factor(homeowner_status))
+```
+
+```{r}
+#create separate dataset for formatting tables in correct order
+d_stack_tables <- d_stack
+
+#re-level offer difference
+d_stack_tables <- d_stack_tables |>
+  mutate(offer_diff_binned_deciles = factor(
+      offer_diff_binned_deciles,
+      level = c("higher by $100,000-$200,000", "higher by $65,000-$95,000", "higher by $40,000-$60,000", "higher by $20,000-$35,000", "higher by $5,000-$15,000", "No difference", "lower by $5,000-$15,000", "lower by $20,000-$35,000", "lower by $40,000-$60,000", "lower by $65,000-$95,000", "lower by $100,000-$200,000")))
+
+#re-level nationality
+d_stack_tables <- d_stack_tables |>
+  mutate(nationality = factor(
+    nationality,
+      level = c( "United States", "Canada", "United Kingdom", "Mexico", "Japan", "India", "Saudi Arabia", "China",  "Russia")))
+
+#re-level reason for buying
+d_stack_tables <- d_stack_tables |>
+  mutate(reason_for_buying = factor(
+    reason_for_buying,
+      level = c("Primary residence", "Vacation home", "Investment")))
+
+#re-level buyer type
+d_stack_tables <- d_stack_tables |>
+  mutate(buyer_type = factor(
+    buyer_type,
+      level = c("Individual", "Corporation")))
+
+#re-level offer type
+d_stack_tables <- d_stack_tables |>
+  mutate(offer_type = factor(
+    offer_type,
+      level = c("All cash", "With financing")))
+```
+
+```{r}
+#basic marginal means with offer_diff_binned_deciles
+m1 <- Y ~ offer_diff_binned_deciles + nationality + offer_type + reason_for_buying + buyer_type
+#marginal means plot
+plot(mm(d_stack, m1, id = ~response_id), vline = 0.5)
+ggsave("basic marginal means.pdf", width=16, height=12)
+
+#latex table for marginal means M1
+table <- xtable::xtable(
+  cj(
+    d_stack_tables, 
+    m1,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+
+```
+
+```{r}
+#make separate dataset for AMCEs in which reference categories are set properly
+AMCE_d_stack <- d_stack
+
+AMCE_d_stack$buyer_type <- relevel(AMCE_d_stack$buyer_type, ref="Individual")
+AMCE_d_stack$nationality <- relevel(AMCE_d_stack$nationality, ref="United States")
+AMCE_d_stack$offer_type <- relevel(AMCE_d_stack$offer_type, ref="All cash")
+AMCE_d_stack$reason_for_buying <- relevel(AMCE_d_stack$reason_for_buying, ref="Primary residence")
+AMCE_d_stack$offer_diff_binned_deciles <- relevel(AMCE_d_stack$offer_diff_binned_deciles, ref="No difference")
+
+#re-label variable names for tables and figures
+attr(AMCE_d_stack$offer_diff_binned_deciles, "label") <- "Offer difference"
+attr(AMCE_d_stack$nationality, "label") <- "Nationality"
+attr(AMCE_d_stack$reason_for_buying, "label") <- "Reason for buying"
+attr(AMCE_d_stack$offer_type, "label") <- "Offer type"
+attr(AMCE_d_stack$buyer_type, "label") <- "Buyer type"
+attr(AMCE_d_stack$offer_diff_simple_bin, "label") <- "Offer difference"
+```
+
+```{r}
+#basic AMCEs with offer_diff_binned_deciles
+plot(cj(AMCE_d_stack, m1, id = ~ response_id, estimate = "amce"))
+ggsave("basic AMCEs.pdf", width=16, height=12)
+
+#latex table for AMCE M1
+table <- xtable::xtable(
+  cj(
+    d_stack_tables, 
+    m1,
+    id = ~ response_id,
+    estimate = "amce"
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#basic marginal means with offer_diff_simple_bin
+m2 <- Y ~ offer_diff_simple_bin + nationality + offer_type + reason_for_buying + buyer_type
+
+plot(mm(d_stack, m2, id = ~response_id), vline = 0.5)
+
+ggsave("basic marginal means_simple bin.pdf", width=12, height=6)
+
+#latex table for M2 (above)
+table <- xtable::xtable(
+  cj(
+    d_stack_tables, 
+    m2,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+
+```
+
+```{r}
+#basic marginal means analysis with interaction terms
+m1i <- Y ~ nationality + offer_type + reason_for_buying + offer_diff_binned_deciles + buyer_type + nationality_offer_type + nationality_reason + nationality_buyer_type + nationality_offer_diff + reason_offer_diff + reason_buyer_type
+plot(mm(d_stack, m1i, id = ~response_id), vline = 0.5)
+
+table <- xtable::xtable(
+  cj(
+    d_stack, 
+    m1i,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "p{1.5in}", "r", "r", "r")
+)
+print(table, include.rownames=FALSE)
+```
+
+```{r}
+###clean plot for reason_buyer_type
+  # store the results when applying the formula to the data
+  results <- mm(d_stack, m1i, id = ~response_id)
+  
+  # now select only variables you want
+  selected_results <- results |> 
+    filter(feature == "reason_buyer_type") |>
+    filter(level!="Corporation_Primary residence") |>
+    filter(level!="Corporation_Vacation home")
+  
+  # run plot
+  plot(selected_results, vline = 0.5, feature_headers = FALSE) +
+      theme(legend.position = "none")
+  ggsave("reason_buyer_type.pdf", width=8, height=4)
+
+
+###clean plot for nationality_reason
+  # store the results when applying the formula to the data
+  results <- mm(d_stack, m1i, id = ~response_id)
+  
+  # now select only variables you want
+  selected_results <- results |> 
+    filter(feature == "nationality_reason")
+
+  # now run plot
+  plot(selected_results, vline = 0.5, feature_headers = FALSE) +
+      theme(legend.position = "none")
+  ggsave("nationality_reason.pdf", width=8, height=8)
+  
+###clean plot for nationality_buyer_type
+  # store the results when applying the formula to the data
+  results <- mm(d_stack, m1i, id = ~response_id)
+  
+  # now select only variables you want
+  selected_results <- results |> 
+    filter(feature == "nationality_buyer_type")
+
+  # now run plot
+  plot(selected_results, vline = 0.5, feature_headers = FALSE) +
+      theme(legend.position = "none")
+  ggsave("nationality_buyer_type.pdf")
+```  
+
+```{r}
+###re-clean demographic data for d_stack
+#convert NAs in number_of_houses owned to 0
+d_stack <- d_stack |>
+mutate(number_of_houses = ifelse(is.na(number_of_houses), 0, number_of_houses))
+test <- d_stack |>
+mutate(number_of_houses = as.factor(number_of_houses))
+unique(pilot_clean$number_of_houses)
+
+#convert NAs in landlord to no
+d_stack <- d_stack |>
+  mutate(landlord = replace_na(landlord, "Not a landlord"))
+unique(d_stack$landlord)
+```
+
+```{r}
+#political ideology marginal means
+d_stack <- d_stack|> mutate(buyer_type=as.factor(buyer_type))
+m1_political_ideology <- cj(d_stack, m1, id = ~response_id, estimate = "mm", h0 = 0.5, by = ~pol_ideology_conservative)
+plot(m1_political_ideology, group="pol_ideology_conservative", alpha=0.834, vline = 0.5)
+ggsave("political ideology_marginal means.pdf", width=16, height=12)
+
+selected_results <- m1_political_ideology |> 
+  filter(feature %in% c("Reason for buying"))
+
+plot(selected_results, group ="pol_ideology_conservative", vline = 0.5, size = 2, feature_headers = FALSE, xlim = c(-0.7, 0.7)) + aes(shape = pol_ideology_conservative) + scale_shape_manual(values = c("Conservative" = 15, "Not conservative" = 17), name = "Political Ideology") +
+  guides(shape = guide_legend(title = "Political Ideology"))
+ggsave("political ideology_reason for buying marginal means.pdf")
+
+#make reference category non-conservative
+d_stack_tables <- d_stack_tables |>
+  mutate(pol_ideology_conservative = factor(
+    pol_ideology_conservative,
+      level = c( "Not conservative", "Conservative")))
+
+#political ideology mm_diffs with offer_diff_binned_deciles
+political_ideology_mm_diffs <- mm_diffs(d_stack_tables, m1, by = ~ pol_ideology_conservative, id = "response_id")
+      
+#latex table for political ideology mm_diffs (above)
+table <- xtable::xtable(
+  political_ideology_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#omnibus f-test for political ideology
+cj_anova(d_stack, m1, by = ~pol_ideology_conservative, id = "response_id")
+```
+
+```{r}
+#political ideology mm_diffs with offer_diff_simple_bin
+  political_ideology_mm_diffs <- mm_diffs(d_stack_tables, m2, by = ~ pol_ideology_conservative, id = "response_id")
+
+#latex table for political ideology offer_diff_simple_bin mm_diffs (above)
+table <- xtable::xtable(
+  political_ideology_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#create separate dataset for conservatives and non-conservatives
+d_stack_conservative <- d_stack_tables |>
+  filter(pol_ideology_conservative=="Conservative")
+d_stack_non_conservative <- d_stack_tables |>
+  filter(pol_ideology_conservative=="Not conservative")
+
+#latex table for marginal means for conservatives
+table <- xtable::xtable(
+  cj(
+    d_stack_conservative, 
+    m1,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#latex table for marginal means for conservatives
+table <- xtable::xtable(
+  cj(
+    d_stack_non_conservative, 
+    m1,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#latex table for marginal means for conservatives (offer diff simplified)
+table <- xtable::xtable(
+  cj(
+    d_stack_conservative, 
+    m2,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#latex table for marginal means for conservatives (offer diff simplified)
+table <- xtable::xtable(
+  cj(
+    d_stack_non_conservative, 
+    m2,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames = FALSE)
+```
+
+```{r}
+#create dataset that only contains Democrats and Republicans
+d_stack_test <- d_stack_tables |>
+  filter(pol_party %in% c("Democrat", "Republican"))
+
+d_stack_test <- d_stack_test |>
+  mutate(pol_party_binary = case_when(pol_party=="Democrat" ~ "Democrat", pol_party=="Republican" ~ "Republican")) |>
+  mutate(pol_party_binary=as.factor(pol_party_binary))
+  d_stack_test$pol_party_binary <- relevel(d_stack_test$pol_party_binary, ref="Democrat")
+
+#political party mm_diffs with offer_diff_binned_deciles
+  political_party_mm_diffs <- mm_diffs(d_stack_test, m1, id = "response_id", by = ~ pol_party_binary)
+
+table <- xtable::xtable(
+  political_party_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}
+#omnibus f-tests for political party
+cj_anova(d_stack_test, m1, by = ~pol_party_binary, id = "response_id")
+```
+
+```{r}
+#re-label variable name for landlord_status
+attr(d_stack$landlord, "label") <- "Landlord"
+
+#landlord subgroup marginal means plot
+m1_landlord <- cj(d_stack, m1, id = ~response_id, estimate = "mm", h0 = 0.5, by = ~landlord)
+
+plot(m1_landlord)
+
+selected_results <- m1_landlord |> 
+  filter(feature %in% c("Buyer type", "Reason for buying"))
+plot(selected_results, group = "landlord", vline = 0.5, feature_headers = FALSE)
+ggsave("landlord marginal means.pdf")
+```
+
+```{r}
+#make reference category non-landlords
+d_stack_tables <- d_stack_tables |>
+  mutate(landlord = factor(
+    landlord,
+      level = c( "Not a landlord", "Landlord")))
+
+#landlord mm_diffs with offer_diff_binned_deciles
+  landlord_mm_diffs <- mm_diffs(d_stack_tables, m1, by = ~landlord, id = "response_id")
+
+table <- xtable::xtable(
+  landlord_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}
+#omnibus f-test for landlord
+cj_anova(d_stack, m1, by = ~landlord, id = "response_id")
+```
+
+```{r}
+#re-label variable name for homeowner_status
+attr(d_stack$homeowner_status, "label") <- "Homeowner"
+
+#make reference category homeowners
+d_stack_tables <- d_stack_tables |>
+  mutate(homeowner_status = factor(
+    homeowner_status,
+      level = c( "Homeowner", "Renter")))
+
+#homeowner_status mm_diffs with offer_diff_binned_deciles
+  homeowner_status_mm_diffs <- mm_diffs(d_stack_tables, m1, by = ~homeowner_status, id = "response_id")
+
+table <- xtable::xtable(
+  homeowner_status_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}
+#homeowner subgroup marginal means plot
+m1_homeowner <- cj(d_stack, m1, id = ~response_id, estimate = "mm", h0 = 0.5, by = ~homeowner_status)
+
+plot(m1_homeowner)
+
+selected_results <- m1_homeowner |> 
+  filter(feature %in% c("Buyer type", "Reason for buying"))
+plot(selected_results, group = "homeowner_status", vline = 0.5, feature_headers = FALSE)
+ggsave("homeowner marginal means.pdf")
+```
+
+```{r}
+#omnibus f-test for homeowner
+cj_anova(d_stack, m1, by = ~homeowner_status, id = "response_id")
+```
+
+
+```{r}
+#Descriptive Statistics
+#create separate data set for demographics
+demographics <- pilot_clean |>
+  select(age, homeowner_status, number_of_houses, landlord, latino, race, household_income, edu_level, gender, citizenship, pol_ideology, pol_party)
+
+demographics <- demographics |>
+  mutate(homeowner_status = as.factor(homeowner_status)) |>
+  mutate(landlord = as.factor(landlord)) |>
+  mutate(latino = as.factor(latino)) |>
+  mutate(race = as.factor(race)) |>
+  mutate(household_income = as.factor(household_income)) |>
+  mutate(edu_level = as.factor(edu_level)) |>
+  mutate(gender = as.factor(gender)) |>
+  mutate(citizenship = as.factor(citizenship)) |>
+  mutate(pol_ideology = as.factor(pol_ideology)) |>
+  mutate(pol_party=as.factor(pol_party)) |>
+  mutate(number_of_houses = as.factor(number_of_houses)) |>
+  mutate(age=as.numeric(age))
+
+demographics_table <- demographics |>
+  select(age, homeowner_status, number_of_houses, landlord, latino, race, household_income, edu_level, gender, citizenship, pol_ideology, pol_party)
+
+tbl_summary(demographics_table, label = list(homeowner_status ~ "Homeowner or Renter",
+                         number_of_houses ~ "Number of Houses Owned",
+                         household_income ~ "Household Income",
+                         gender ~ "Gender",
+                         pol_ideology ~ "Political Ideology",
+                         pol_party ~ "Political Party",
+                         edu_level ~ "Education Level",
+                         age ~ "Age",
+                         race ~ "Race",
+                         latino ~ "Latino",
+                         citizenship ~ "Citizenship Status",
+                         landlord ~ "Landlord"), 
+                         statistic = list(
+      all_continuous() ~ "{median} ({min}) ({max})")) |>
+as_gt() |> # convert to gt table
+gt::gtsave( # save table
+filename = "demo_table.ltx")         
+```
+
+```{r}
+###Diagnostic tests
+#test for respondent attentiveness
+
+#calculate number of attentive vs. not-attentive respondents
+pilot_clean <- pilot_clean |>
+  mutate(response_quality=as.factor(response_quality))
+summary(pilot_clean$response_quality)
+
+d_stack <- d_stack |>
+  mutate(response_quality=as.factor(response_quality))
+
+d_stack_tables <- d_stack_tables |>
+  mutate(response_quality=as.factor(response_quality))
+
+attentiveness <- cj(d_stack, m1, id = ~response_id, estimate = "mm", h0=0.5, by = ~response_quality)
+selected_results <- attentiveness
+
+plot(selected_results, group = "response_quality", vline = 0.5)
+ggsave("attentiveness_basic marginal means.pdf", width=12, height=6)
+
+#attentiveness mm_diffs with offer_diff_binned_deciles
+  attentiveness_mm_diffs <- mm_diffs(d_stack_tables, m1, by = ~response_quality, id = "response_id")
+
+table <- xtable::xtable(
+  attentiveness_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}  
+#omnibus f-test for attentiveness
+cj_anova(d_stack, m1, id = ~response_id, by = ~response_quality)
+```
+
+```{r}
+#make separate datasets for attentiveness
+d_stack_good <- d_stack_tables |>
+  filter(response_quality=="good")
+
+d_stack_bad <- d_stack_tables |>
+  filter(response_quality=="bad")
+```
+
+```{r}
+#create latex table for good quality responses
+table <- xtable::xtable(
+  cj(
+    d_stack_good, 
+    m1,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error","p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}
+#create latex table for bad quality responses
+table <- xtable::xtable(
+  cj(
+    d_stack_bad, 
+    m1,
+    id = ~ response_id,
+    estimate = "mm",
+    h0 = 0.5
+  )[c("feature", "level", "estimate", "std.error","p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}
+#test for carryover effects
+#create binary scenario number variable
+d_stack <- d_stack |>
+  mutate(scenario_num=as.numeric(scenario_num))
+d_stack <- d_stack |>
+  mutate(scenario_num_binary = case_when(scenario_num <=5 ~ "scenarios 1-5", scenario_num>5 ~ "scenarios 6-10"))
+d_stack <- d_stack |>
+  mutate(scenario_num_binary=as.factor(scenario_num_binary))
+```
+
+```{r}
+#omnibus f-test for carryover effects
+cj_anova(d_stack, m1, id = ~response_id, by = ~scenario_num_binary)
+```
+
+```{r}
+#create plot for carryover effects
+carryover_effects <- cj(d_stack, m1, id = ~response_id, estimate = "mm", h0=0.5, by = ~scenario_num_binary)
+selected_results <- carryover_effects
+plot(selected_results, group = "scenario_num_binary", vline = 0.5)
+ggsave("carryover effects_binary_basic marginal means.pdf", width=12, height=6)
+```
+
+```{r}
+#create binary scenario number variable for d_stack_tables
+d_stack_tables <- d_stack_tables |>
+  mutate(scenario_num=as.numeric(scenario_num))
+d_stack_tables <- d_stack_tables |>
+  mutate(scenario_num_binary = case_when(scenario_num <=5 ~ "scenarios 1-5", scenario_num>5 ~ "scenarios 6-10"))
+d_stack_tables <- d_stack_tables |>
+  mutate(scenario_num_binary=as.factor(scenario_num_binary))
+
+#carryover_effects mm_diffs with offer_diff_binned_deciles
+  carryover_effects_mm_diffs <- mm_diffs(d_stack_tables, m1, by = ~scenario_num_binary, id = "response_id")
+
+table <- xtable::xtable(
+  carryover_effects_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+```{r}
+#test for profile order effects
+d_stack <- d_stack |>
+  mutate(offer_num=as.factor(offer_num))
+
+#create plot for profile order effects
+profile_order_effects_mm <- cj(d_stack, m1, id = ~response_id, estimate = "mm", h0=0.5, by = ~offer_num)
+selected_results <- profile_order_effects_mm
+plot(selected_results, group = "offer_num", vline = 0.5)
+ggsave("profile order effects_basic marginal means.pdf", width=12, height=6)
+```
+
+```{r}
+d_stack_tables <- d_stack_tables |>
+  mutate(offer_num=as.factor(offer_num))
+
+#profile order effects mm_diffs with offer_diff_binned_deciles
+  profile_order_effects_mm_diffs <- mm_diffs(d_stack_tables, m1, by = ~scenario_num_binary, id = "response_id")
+table <- xtable::xtable(
+  profile_order_effects_mm_diffs[c("feature", "level", "estimate", "std.error", "p")],
+  digits = 4, align = c("l", "l", "l", "r", "r", "r")
+)
+
+# Create a function to format the coefficient with significance stars
+format_coefficient <- function(est, p) {
+  stars <- ifelse(p < 0.001, "***",
+                  ifelse(p < 0.01, "**",
+                         ifelse(p < 0.05, "*", "")))
+  paste0(formatC(est, format = "f", digits = 4), stars)
+}
+
+# Apply the formatting function to the estimate column
+table$estimate <- Map(format_coefficient, table$estimate, table$p)
+
+# Remove the "p" column, as we no longer need it
+table$p <- NULL
+
+# Print the modified table
+print(table, include.rownames=FALSE, width=16, height=12)
+```
+
+
